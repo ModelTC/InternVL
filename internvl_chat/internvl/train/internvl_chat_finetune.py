@@ -41,6 +41,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils.logging import (enable_default_handler,
                                         enable_explicit_format, set_verbosity)
 
+from internvl.train.fast_dataset import BalancedDataset, fast_concat_pad_data_collator
 # Upgrade transformers to v4.37.2, we don't need it anymore
 # replace_llama2_attn_with_flash_attn()
 replace_llama_rmsnorm_with_fused_rmsnorm()
@@ -138,6 +139,10 @@ class ModelArguments:
         metadata={'help': 'Specify the version of pixel shuffle implementation. Default is `v1`.'
                           'Please use `v2` to fix the bug of transposed image.'}
     )
+    tokenizer_path: Optional[str] = field(
+        default=None,
+        metadata={'help': 'Path to tokenizer'}
+    )
 
 
 @dataclass
@@ -201,6 +206,26 @@ class DataTrainingArguments:
         default='imagenet',
         metadata={'help': 'The normalize type for the image. Default is imagenet.'},
     )
+    use_fast_dataset: Optional[bool] = field(
+        default=False,
+        metadata={'help': 'Set to True to use fast dataset.'},
+    )
+    vit_packed_length: Optional[int] = field(
+        default=9,
+        metadata={'help': 'The value for vit packed length. Default is 9.'},
+    )
+    llm_packed_length: Optional[int] = field(
+        default=4096,
+        metadata={'help': 'The value for llm packed length. Default is 4096.'},
+    )
+    llm_thresh: Optional[int] = field(
+        default=4068,
+        metadata={'help': 'The value for llm thresh. Default is 4068.'},
+    )
+    iter_time: Optional[int] = field(
+        default=100,
+        metadata={'help': 'The value for iter_time. Default is 100.'},
+    )
 
 
 class LazySupervisedDataset(Dataset):
@@ -209,7 +234,7 @@ class LazySupervisedDataset(Dataset):
     def __init__(self, template_name, meta, tokenizer, tcs_loader, num_image_token,
                  image_size=224, is_train=True, pad2square=False, group_by_length=False,
                  dynamic_image_size=False, use_thumbnail=False, min_dynamic_patch=1,
-                 max_dynamic_patch=6, repeat_time=1, normalize_type='imagenet'):
+                 max_dynamic_patch=6, repeat_time=1, normalize_type='imagenet', use_fast_dataset=False):
         super(LazySupervisedDataset, self).__init__()
         self.tokenizer = tokenizer
         self.template_name = template_name
@@ -239,6 +264,8 @@ class LazySupervisedDataset(Dataset):
         self.min_dynamic_patch = min_dynamic_patch
         self.max_dynamic_patch = max_dynamic_patch
         self.normalize_type = normalize_type
+        self.meta = meta
+        self.use_fast_dataset = use_fast_dataset
         if self.group_by_length:
             self.conv2length = {}  # using dict to speedup the calculation of token length
             self.length = []
@@ -295,9 +322,11 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
+
+        group_by_length = True if self.use_fast_dataset else self.group_by_length
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, self.num_image_token * num_patches,
-                                  group_by_length=self.group_by_length, ds_name=self.ds_name)
+                                  group_by_length=group_by_length, ds_name=self.ds_name)
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
@@ -325,9 +354,10 @@ class LazySupervisedDataset(Dataset):
             preprocess_function = preprocess_phi3
         else:
             preprocess_function = preprocess
+        group_by_length = True if self.use_fast_dataset else self.group_by_length
         ret = preprocess_function(self.template_name, [deepcopy(data_item['conversations'])],
                                   self.tokenizer, self.num_image_token * num_patches, text_only=True,
-                                  group_by_length=self.group_by_length, ds_name=self.ds_name)
+                                  group_by_length=group_by_length, ds_name=self.ds_name)
         ret = dict(
             input_ids=ret['input_ids'][0],
             labels=ret['labels'][0],
@@ -389,6 +419,7 @@ def build_datasets(data_args, tokenizer, tcs_loader, model, group_by_length=Fals
                 max_dynamic_patch=max_num,
                 repeat_time=repeat_time,
                 normalize_type=normalize_type,
+                use_fast_dataset=data_args.use_fast_dataset
             )
         except Exception:
             logger.info(f'Error in loading dataset: {ds_name}')
@@ -471,7 +502,10 @@ def main():
     set_seed(training_args.seed)
 
     # Load pretrained model, tokenizer, and image processor
-    tokenizer_path = model_args.model_name_or_path or model_args.llm_path
+    if model_args.tokenizer_path is not None:
+        tokenizer_path = model_args.tokenizer_path
+    else:
+        tokenizer_path = model_args.model_name_or_path or model_args.llm_path
     logger.info(f'Loading Tokenizer: {tokenizer_path}')
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_path, add_eos_token=False, trust_remote_code=True, use_fast=False)
@@ -517,9 +551,16 @@ def main():
         else:
             llm_config._attn_implementation = 'flash_attention_2'  # for LLaMA
             logger.info('Using flash_attention_2 for LLaMA')
-        llm = AutoModelForCausalLM.from_pretrained(
-            model_args.llm_path, torch_dtype=torch.bfloat16,
-            config=llm_config, trust_remote_code=True)
+        if llm_config.model_type == 'internlm2':
+            from internvl.model.internlm2.modeling_internlm2 import InternLM2ForCausalLM
+            llm = InternLM2ForCausalLM.from_pretrained(model_args.llm_path,
+                                                       torch_dtype=torch.bfloat16,
+                                                       config=llm_config,
+                                                       trust_remote_code=True)
+        else:
+            llm = AutoModelForCausalLM.from_pretrained(
+                model_args.llm_path, torch_dtype=torch.bfloat16,
+                config=llm_config, trust_remote_code=True)
         logger.info('Building InternVLChatConfig...')
         internvl_chat_config = InternVLChatConfig(
             vision_config.to_dict(), llm_config.to_dict(), downsample_ratio=data_args.down_sample_ratio,
@@ -575,6 +616,17 @@ def main():
         dynamic_image_size=data_args.dynamic_image_size, use_thumbnail=data_args.use_thumbnail,
         min_dynamic_patch=data_args.min_dynamic_patch, max_dynamic_patch=data_args.max_dynamic_patch,
         normalize_type=data_args.normalize_type)
+
+    if data_args.use_fast_dataset:
+        train_dataset = BalancedDataset(
+            dataset=train_dataset,
+            tokenizer=deepcopy(tokenizer),
+            vit_packed_length=data_args.vit_packed_length, # 20, # 14,8
+            llm_packed_length=data_args.llm_packed_length, # 8192, # 6144 4096,
+            iter_time=data_args.iter_time,
+            llm_thresh={"thresh": data_args.llm_thresh}, # 8064 6016 4068
+        )
+        concat_pad_data_collator = fast_concat_pad_data_collator
 
     def _freeze_params(module):
         for param in module.parameters():
